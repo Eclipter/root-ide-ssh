@@ -52,7 +52,7 @@ No containers, `sudo`, `nsenter`, chroot, or secondary UID 0 accounts are involv
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<USER>/root-ide-ssh/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Eclipter/root-ide-ssh/main/install.sh | sudo bash
 ```
 
 The installer configures the shared SSH wrapper and SSH server settings.
