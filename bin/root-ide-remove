@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+
+die() {
+    echo "root-ide-remove: $*" >&2
+    exit 1
+}
+
+usage() {
+    echo "Usage:"
+    echo "  root-ide-remove <name>"
+    echo "  root-ide-remove <name> --delete-home"
+    exit 2
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ $# -ge 1 && $# -le 2 ]] || usage
+
+NAME=$1
+DELETE_HOME=false
+
+if [[ $# -eq 2 ]]; then
+    [[ "$2" == "--delete-home" ]] || usage
+    DELETE_HOME=true
+fi
+
+[[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+    die "invalid name"
+
+IDE_HOME="/root/${NAME}_ide"
+
+[[ -f "$AUTHORIZED_KEYS" ]] ||
+    die "$AUTHORIZED_KEYS does not exist"
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+awk \
+    -v home="$IDE_HOME" '
+{
+    if (index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") > 0 &&
+        index($0, "environment=\"IDE_HOME=" home "\"") > 0)
+        next
+
+    print
+}
+' "$AUTHORIZED_KEYS" > "$tmp"
+
+if cmp -s "$AUTHORIZED_KEYS" "$tmp"; then
+    die "user not found: $NAME"
+fi
+
+cat "$tmp" > "$AUTHORIZED_KEYS"
+chmod 0600 "$AUTHORIZED_KEYS"
+
+if $DELETE_HOME; then
+    case "$IDE_HOME" in
+        /root/*_ide)
+            rm -rf -- "$IDE_HOME"
+            ;;
+        *)
+            die "refusing to delete suspicious path: $IDE_HOME"
+            ;;
+    esac
+fi
+
+echo "removed: $NAME"
+
+if $DELETE_HOME; then
+    echo "deleted: $IDE_HOME"
+else
+    echo "preserved: $IDE_HOME"
+fi

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_HOME=/root
+
+if [[ -n "${IDE_HOME:-}" ]]; then
+    mkdir -p "$IDE_HOME"
+
+    shopt -s dotglob nullglob
+
+    for src in "$ROOT_HOME"/*; do
+        name=${src##*/}
+
+        # Per-user state: never link these from /root.
+        case "$name" in
+            .cursor|.cursor-server|.local|.cache|.config)
+                continue
+                ;;
+        esac
+
+        # Never expose another generated IDE home through this HOME.
+        case "$name" in
+            *_ide)
+                continue
+                ;;
+        esac
+
+        [[ "$src" == "$IDE_HOME" ]] && continue
+
+        dst="$IDE_HOME/$name"
+
+        [[ -e "$dst" || -L "$dst" ]] ||
+            ln -s "$src" "$dst"
+    done
+
+    export HOME="$IDE_HOME"
+    cd "$HOME"
+fi
+
+SHELL_BIN="${SHELL:-/bin/bash}"
+
+[[ -x "$SHELL_BIN" ]] || SHELL_BIN=/bin/bash
+[[ -x "$SHELL_BIN" ]] || SHELL_BIN=/bin/sh
+
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+    exec "$SHELL_BIN" -c "$SSH_ORIGINAL_COMMAND"
+else
+    exec "$SHELL_BIN" -l
+fi

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+
+[[ -f "$AUTHORIZED_KEYS" ]] || exit 0
+
+printf '%-20s %-32s %-16s %s\n' \
+    NAME HOME KEY_TYPE COMMENT
+
+printf '%-20s %-32s %-16s %s\n' \
+    ---- ---- -------- -------
+
+awk '
+index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") {
+    home = $1
+
+    sub(/^.*environment="IDE_HOME=/, "", home)
+    sub(/".*$/, "", home)
+    home = "/" home
+
+    name = home
+    sub(/^\/root\//, "", name)
+    sub(/_ide$/, "", name)
+
+    key_type = $2
+
+    comment = ""
+    for (i = 4; i <= NF; i++) {
+        if (comment != "")
+            comment = comment " "
+        comment = comment $i
+    }
+
+    printf "%-20s %-32s %-16s %s\n",
+           name, home, key_type, comment
+}
+' "$AUTHORIZED_KEYS"

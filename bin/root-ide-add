@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+WRAPPER=/usr/local/libexec/root-ide-ssh
+
+die() {
+    echo "root-ide-add: $*" >&2
+    exit 1
+}
+
+usage() {
+    echo "Usage:"
+    echo "  root-ide-add <name> < public_key.pub"
+    echo "  root-ide-add <name> 'ssh-ed25519 AAAA... comment'"
+    exit 2
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ $# -ge 1 && $# -le 2 ]] || usage
+[[ -x "$WRAPPER" ]] || die "root-ide-ssh is not installed"
+
+NAME=$1
+
+[[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+    die "name may contain only letters, numbers, _ and -"
+
+if [[ $# -eq 2 ]]; then
+    PUBKEY=$2
+else
+    IFS= read -r PUBKEY || true
+fi
+
+[[ -n "${PUBKEY:-}" ]] || die "public key is empty"
+
+read -r KEY_TYPE KEY_DATA KEY_COMMENT <<< "$PUBKEY"
+
+case "$KEY_TYPE" in
+    ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*)
+        ;;
+    *)
+        die "unsupported or invalid public key type: $KEY_TYPE"
+        ;;
+esac
+
+[[ -n "${KEY_DATA:-}" ]] || die "invalid public key"
+
+# Validate actual key data.
+tmp_key="$(mktemp)"
+tmp_ak="$(mktemp)"
+trap 'rm -f "$tmp_key" "$tmp_ak"' EXIT
+
+printf '%s %s\n' "$KEY_TYPE" "$KEY_DATA" > "$tmp_key"
+ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1 ||
+    die "invalid SSH public key"
+
+IDE_HOME="/root/${NAME}_ide"
+
+install -d -m 0700 "$IDE_HOME"
+install -d -m 0700 /root/.ssh
+touch "$AUTHORIZED_KEYS"
+chmod 0600 "$AUTHORIZED_KEYS"
+
+# Remove:
+#   - previous entry for this IDE_HOME
+#   - previous managed entry using the same key
+awk \
+    -v home="$IDE_HOME" \
+    -v key="$KEY_DATA" '
+{
+    managed = index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") > 0
+    same_home = index($0, "environment=\"IDE_HOME=" home "\"") > 0
+    same_key = managed && index($0, key) > 0
+
+    if (!same_home && !same_key)
+        print
+}
+' "$AUTHORIZED_KEYS" > "$tmp_ak"
+
+cat "$tmp_ak" > "$AUTHORIZED_KEYS"
+
+COMMENT="${KEY_COMMENT:-$NAME}"
+
+printf '%s\n' \
+    "environment=\"IDE_HOME=$IDE_HOME\",command=\"$WRAPPER\" $KEY_TYPE $KEY_DATA $COMMENT" \
+    >> "$AUTHORIZED_KEYS"
+
+chmod 0600 "$AUTHORIZED_KEYS"
+
+echo "$NAME -> $IDE_HOME"
