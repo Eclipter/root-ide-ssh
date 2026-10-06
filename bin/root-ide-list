@@ -2,37 +2,63 @@
 set -euo pipefail
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+DATA_BASE=/var/lib/root-ide
 
-[[ -f "$AUTHORIZED_KEYS" ]] || exit 0
-
-printf '%-20s %-32s %-16s %s\n' \
-    NAME HOME KEY_TYPE COMMENT
-
-printf '%-20s %-32s %-16s %s\n' \
-    ---- ---- -------- -------
-
-awk '
-index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") {
-    home = $1
-
-    sub(/^.*environment="IDE_HOME=/, "", home)
-    sub(/".*$/, "", home)
-    home = "/" home
-
-    name = home
-    sub(/^\/root\//, "", name)
-    sub(/_ide$/, "", name)
-
-    key_type = $2
-
-    comment = ""
-    for (i = 4; i <= NF; i++) {
-        if (comment != "")
-            comment = comment " "
-        comment = comment $i
-    }
-
-    printf "%-20s %-32s %-16s %s\n",
-           name, home, key_type, comment
+die() {
+    echo "root-ide-list: $*" >&2
+    exit 1
 }
-' "$AUTHORIZED_KEYS"
+
+is_managed_line() {
+    [[ "$1" == 'environment="ROOT_IDE_USER='*'",command="/usr/local/libexec/root-ide-ssh" '* ]]
+}
+
+parse_managed_line() {
+    local rest=${1#environment=\"ROOT_IDE_USER=}
+
+    MANAGED_USER=${rest%%\"*}
+
+    rest=${1#* }
+    MANAGED_TYPE=${rest%%[[:space:]]*}
+    rest=${rest#"$MANAGED_TYPE"}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    MANAGED_DATA=${rest%%[[:space:]]*}
+    MANAGED_COMMENT=${rest#"$MANAGED_DATA"}
+    MANAGED_COMMENT=${MANAGED_COMMENT#"${MANAGED_COMMENT%%[![:space:]]*}"}
+}
+
+main() {
+    local line
+
+    [[ $EUID -eq 0 ]] || die "run as root"
+
+    printf '%-20s %-40s %-28s %s\n' \
+        NAME DATA_DIR KEY_TYPE COMMENT
+    printf '%-20s %-40s %-28s %s\n' \
+        ---- -------- -------- -------
+
+    if [[ -L "$AUTHORIZED_KEYS" ]]; then
+        die "refusing to read symlink: $AUTHORIZED_KEYS"
+    fi
+
+    [[ -f "$AUTHORIZED_KEYS" ]] || exit 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        is_managed_line "$line" || continue
+
+        parse_managed_line "$line"
+
+        [[ "$MANAGED_USER" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        [[ -n "$MANAGED_TYPE" && -n "$MANAGED_DATA" ]] || continue
+
+        printf '%-20s %-40s %-28s %s\n' \
+            "$MANAGED_USER" \
+            "$DATA_BASE/$MANAGED_USER" \
+            "$MANAGED_TYPE" \
+            "$MANAGED_COMMENT"
+    done < "$AUTHORIZED_KEYS"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -2,74 +2,149 @@
 set -euo pipefail
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+DATA_BASE=/var/lib/root-ide
+TMP_FILES=()
 
 die() {
     echo "root-ide-remove: $*" >&2
     exit 1
 }
 
+track_tmp() {
+    TMP_FILES+=("$1")
+}
+
+cleanup_tmp() {
+    if [[ ${#TMP_FILES[@]} -gt 0 ]]; then
+        rm -f -- "${TMP_FILES[@]}"
+    fi
+}
+
 usage() {
-    echo "Usage:"
-    echo "  root-ide-remove <name>"
-    echo "  root-ide-remove <name> --delete-home"
-    exit 2
+    cat <<'EOF'
+Usage:
+  root-ide-remove <name>
+  root-ide-remove <name> --delete-data
+EOF
 }
 
-[[ $EUID -eq 0 ]] || die "run as root"
-[[ $# -ge 1 && $# -le 2 ]] || usage
-
-NAME=$1
-DELETE_HOME=false
-
-if [[ $# -eq 2 ]]; then
-    [[ "$2" == "--delete-home" ]] || usage
-    DELETE_HOME=true
-fi
-
-[[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
-    die "invalid name"
-
-IDE_HOME="/root/${NAME}_ide"
-
-[[ -f "$AUTHORIZED_KEYS" ]] ||
-    die "$AUTHORIZED_KEYS does not exist"
-
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-
-awk \
-    -v home="$IDE_HOME" '
-{
-    if (index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") > 0 &&
-        index($0, "environment=\"IDE_HOME=" home "\"") > 0)
-        next
-
-    print
+is_managed_line() {
+    [[ "$1" == 'environment="ROOT_IDE_USER='*'",command="/usr/local/libexec/root-ide-ssh" '* ]]
 }
-' "$AUTHORIZED_KEYS" > "$tmp"
 
-if cmp -s "$AUTHORIZED_KEYS" "$tmp"; then
-    die "user not found: $NAME"
-fi
+managed_user() {
+    local rest=${1#environment=\"ROOT_IDE_USER=}
+    printf '%s\n' "${rest%%\"*}"
+}
 
-cat "$tmp" > "$AUTHORIZED_KEYS"
-chmod 0600 "$AUTHORIZED_KEYS"
+safe_delete_user_data() {
+    local name=$1
+    local base=$DATA_BASE
+    local data="$base/$name"
+    local parent child
 
-if $DELETE_HOME; then
-    case "$IDE_HOME" in
-        /root/*_ide)
-            rm -rf -- "$IDE_HOME"
-            ;;
-        *)
-            die "refusing to delete suspicious path: $IDE_HOME"
-            ;;
-    esac
-fi
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        die "refusing to delete suspicious user: $name"
 
-echo "removed: $NAME"
+    [[ -e "$base" || -L "$base" ]] || return 0
 
-if $DELETE_HOME; then
-    echo "deleted: $IDE_HOME"
-else
-    echo "preserved: $IDE_HOME"
+    if [[ -L "$base" || ! -d "$base" ]]; then
+        die "refusing to delete through invalid data root: $base"
+    fi
+
+    [[ -e "$data" || -L "$data" ]] || return 0
+
+    if [[ -L "$data" || ! -d "$data" ]]; then
+        die "refusing to delete invalid data directory: $data"
+    fi
+
+    command -v realpath >/dev/null 2>&1 ||
+        die "realpath not found"
+
+    parent=$(realpath -e -- "$base") ||
+        die "cannot resolve $base"
+    child=$(realpath -e -- "$data") ||
+        die "cannot resolve $data"
+
+    [[ -n "$parent" && -n "$child" ]] ||
+        die "refusing to delete unresolved path: $data"
+    [[ "$child" == "$parent/$name" ]] ||
+        die "refusing to delete unexpected path: $child"
+    [[ "$child" != "$parent" && "$child" != / ]] ||
+        die "refusing to delete unexpected path: $child"
+
+    rm -rf -- "$child"
+}
+
+main() {
+    local name delete_data line found tmp
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
+    [[ $EUID -eq 0 ]] || die "run as root"
+    [[ $# -ge 1 && $# -le 2 ]] || {
+        usage >&2
+        exit 2
+    }
+
+    name=$1
+    delete_data=false
+
+    if [[ $# -eq 2 ]]; then
+        [[ "$2" == "--delete-data" ]] || {
+            usage >&2
+            exit 2
+        }
+        delete_data=true
+    fi
+
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        die "invalid name"
+
+    if [[ -L "$AUTHORIZED_KEYS" ]]; then
+        die "refusing to edit symlink: $AUTHORIZED_KEYS"
+    fi
+
+    [[ -f "$AUTHORIZED_KEYS" ]] ||
+        die "$AUTHORIZED_KEYS does not exist"
+
+    found=0
+    trap cleanup_tmp EXIT
+    tmp=$(mktemp "$(dirname -- "$AUTHORIZED_KEYS")/.authorized_keys.XXXXXX") ||
+        die "cannot create a temporary authorized_keys file"
+    track_tmp "$tmp"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if is_managed_line "$line" && [[ "$(managed_user "$line")" == "$name" ]]; then
+            found=1
+            continue
+        fi
+
+        printf '%s\n' "$line"
+    done < "$AUTHORIZED_KEYS" > "$tmp"
+
+    [[ "$found" -eq 1 ]] || die "user not found: $name"
+
+    if $delete_data; then
+        safe_delete_user_data "$name"
+    fi
+
+    chmod 0600 -- "$tmp"
+    mv -f -- "$tmp" "$AUTHORIZED_KEYS"
+    TMP_FILES=()
+
+    echo "removed: $name"
+
+    if $delete_data; then
+        echo "deleted: $DATA_BASE/$name"
+    else
+        echo "preserved: $DATA_BASE/$name"
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

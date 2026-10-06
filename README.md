@@ -1,44 +1,41 @@
 # root-ide-ssh
 
-Run Cursor / VS Code Remote SSH as real host `root`, while giving each SSH key its own isolated HOME and IDE state.
+Real host-root SSH sessions with per-key private IDE state via mount namespaces.
 
-This is intended for trusted multi-user servers where all users are allowed full root access, but should not share the same `.cursor-server`, `.cursor`, `.local`, `.config`, etc.
+Everyone logs in as the real host `root`: UID 0 and `HOME=/root`. Each SSH session runs in its own mount namespace, where a short whitelist of IDE directories is bind-mounted from that key's backing store. Every other file under `/root` is the real shared file. New dotfiles such as `.ansible`, `.docker`, `.cargo`, and `.kube` are shared with no extra configuration.
 
-## How it works
+The namespace is not a security boundary. It only makes Cursor / VS Code see per-key state at the usual `/root/.cursor` paths.
 
-All users SSH as the real `root` user.
-
-Each SSH key gets its own `IDE_HOME`, for example:
+## Layout
 
 ```text
-/root/username1_ide
-/root/username2_ide
+HOME=/root
+
+/root/.bashrc          real shared /root/.bashrc
+/root/.ssh             real shared /root/.ssh
+/root/.ansible         real shared /root/.ansible
+/root/.docker          real shared /root/.docker
+/root/.cargo           real shared /root/.cargo
+/root/.kube            real shared /root/.kube
+
+/root/.cursor          bind mount of /var/lib/root-ide/<user>/.cursor
+/root/.cursor-server   bind mount of /var/lib/root-ide/<user>/.cursor-server
 ```
 
-A forced SSH command:
-
-- sets `HOME` to the key-specific `IDE_HOME`;
-- keeps the process running as UID `0`;
-- preserves normal host-root semantics;
-- symlinks shared files from `/root`;
-- leaves IDE/application state private.
-
-Example layout:
+Private whitelist, edited as `PRIVATE_DIRS` in `libexec/root-ide-ssh`:
 
 ```text
-/root/username_ide/
-├── .bashrc        -> /root/.bashrc
-├── .profile       -> /root/.profile
-├── .ssh           -> /root/.ssh
-├── .gitconfig     -> /root/.gitconfig
-├── .cursor/
-├── .cursor-server/
-├── .local/
-├── .cache/
-└── .config/
+.cursor
+.cursor-server
 ```
 
-Commands still execute directly on the host:
+Backing directories are mode `0700`. They are created on the first SSH session. When the last process in that mount namespace exits, the binds disappear and the data stays in `/var/lib/root-ide/<user>/`.
+
+If `/root/.cursor` already exists on the host, the bind hides it for that session only. The host directory is still there afterward. If it did not exist, the session creates an empty mountpoint directory on the host. Console logins and host processes do not see the per-key binds.
+
+## Sessions
+
+The forced command is a mount namespace and then a normal shell. No `sudo`, `nsenter`, `/host`, containers, extra accounts, or CLI wrappers.
 
 ```bash
 systemctl restart nginx
@@ -47,43 +44,68 @@ docker ps
 cat /etc/shadow
 ```
 
-No containers, `sudo`, `nsenter`, chroot, or secondary UID 0 accounts are involved.
+`/proc`, systemd, docker, and the network stay the host's. The installer does not change the PAM stack, and it does not disable `pam_systemd`.
+
+An interactive session runs `/bin/bash -l`. A remote command runs `/bin/bash -c "$SSH_ORIGINAL_COMMAND"`. `HOME` stays `/root`.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Eclipter/root-ide-ssh/main/install.sh | sudo bash
+git clone https://github.com/Eclipter/root-ide-ssh.git
+cd root-ide-ssh
+sudo ./install.sh
 ```
 
-The installer configures the shared SSH wrapper and SSH server settings.
+This installs:
+
+```text
+/usr/local/sbin/root-ide-add
+/usr/local/sbin/root-ide-remove
+/usr/local/sbin/root-ide-list
+/usr/local/libexec/root-ide-ssh
+/etc/ssh/sshd_config.d/00-root-ide.conf
+/var/lib/root-ide/
+```
+
+The drop-in is:
+
+```text
+PermitRootLogin prohibit-password
+UsePAM yes
+PermitUserEnvironment ROOT_IDE_USER
+```
+
+`install.sh` checks `sshd -t` and reloads `ssh` or `sshd` when that service is running.
 
 ## Add a user
 
 ```bash
-root-ide-add username 'ssh-ed25519 AAAA... username@example.com'
+root-ide-add <user> < ~/.ssh/id_ed25519.pub
 ```
 
-This creates:
+or:
+
+```bash
+root-ide-add <user> 'ssh-ed25519 AAAA... comment'
+```
+
+That creates `/var/lib/root-ide/<user>` and one managed line in `/root/.ssh/authorized_keys`:
 
 ```text
-/root/username_ide
+environment="ROOT_IDE_USER=<user>",command="/usr/local/libexec/root-ide-ssh" ssh-ed25519 AAAA... comment
 ```
 
-and adds a key-specific entry to:
+Each name has one key and one data directory. Running add again for the same name or the same key replaces that managed line.
 
-```text
-/root/.ssh/authorized_keys
+```bash
+root-ide-list
+root-ide-remove <user>
+root-ide-remove <user> --delete-data
 ```
 
-Equivalent entry:
+`root-ide-remove` deletes the managed line. It keeps `/var/lib/root-ide/<user>` unless `--delete-data` is given, and it only deletes that exact directory.
 
-```text
-environment="IDE_HOME=/root/username_ide",command="/usr/local/libexec/root-ide-ssh" ssh-ed25519 AAAA... user@example.com
-```
-
-## Client configuration
-
-Example `~/.ssh/config`:
+## Client
 
 ```sshconfig
 Host myhost
@@ -91,61 +113,43 @@ Host myhost
     User root
 ```
 
-Then connect normally from Cursor / VS Code Remote SSH.
+Connect with Cursor / VS Code Remote SSH as usual.
 
 ## Verify
 
 ```bash
-ssh monitor '
-echo "HOME=$HOME"
-echo "IDE_HOME=$IDE_HOME"
-id -u
-pwd
-'
+ssh root@myhost 'printf "HOME=%s\nUID=%s\n" "$HOME" "$(id -u)"; findmnt -n --target /root/.cursor'
 ```
 
-Expected:
+`HOME` is `/root`, UID is `0`, and the mount source for `/root/.cursor` contains `/var/lib/root-ide/<user>/.cursor`.
 
-```text
-HOME=/root/username_ide
-IDE_HOME=/root/username_ide
-0
-/root/username_ide
+## Uninstall
+
+From a checkout:
+
+```bash
+sudo ./uninstall.sh
+sudo ./uninstall.sh --delete-data
 ```
 
-## Shared vs private state
-
-The following directories are private per SSH key:
-
-```text
-.cursor
-.cursor-server
-.local
-.cache
-.config
-```
-
-Other top-level entries from `/root` are exposed through symlinks.
-
-New files added to `/root` are linked automatically on subsequent SSH sessions.
+This removes the binaries and the sshd drop-in, checks `sshd -t`, and reloads sshd when it is running. Managed lines are turned back into ordinary root public keys so a login is not left with a forced command pointing at a missing wrapper. `/var/lib/root-ide/*` is kept unless `--delete-data` is passed. That flag deletes only checked directories directly under `/var/lib/root-ide/`.
 
 ## Requirements
 
-- Linux
-- OpenSSH server
-- root SSH login via public key
-- `PermitUserEnvironment` support
+- Linux with mount namespaces (`unshare` and `mount` from util-linux)
+- OpenSSH server with public-key root login
+- `PermitUserEnvironment` accepting a variable name
 - trusted users
+
+Alpine/BusyBox is not supported.
 
 ## Security
 
-This project does **not** provide user isolation.
+This is not security isolation.
 
-Every configured user runs as the real host UID `0` and therefore has unrestricted root access to the machine and to other users' IDE homes.
+Every configured user is the real host UID 0. They can read and change the machine, other sessions, and other keys' backing directories under `/var/lib/root-ide`. Password root login is disabled because the SSH key selects `ROOT_IDE_USER`.
 
-Use this only when all configured users are fully trusted.
-
-Password-based root login is intentionally not used because the SSH key identifies which `IDE_HOME` should be selected.
+Use this only when every configured user is fully trusted.
 
 ## License
 

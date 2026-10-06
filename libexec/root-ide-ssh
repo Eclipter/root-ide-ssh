@@ -1,49 +1,179 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_HOME=/root
+# Per-key bind mounts. Every other path under /root stays the real host file.
+PRIVATE_DIRS=(
+    .cursor
+    .cursor-server
+)
 
-if [[ -n "${IDE_HOME:-}" ]]; then
-    mkdir -p "$IDE_HOME"
+INSIDE_FLAG=--inside-namespace
+DATA_BASE=/var/lib/root-ide
 
-    shopt -s dotglob nullglob
+die() {
+    echo "root-ide-ssh: $*" >&2
+    exit 1
+}
 
-    for src in "$ROOT_HOME"/*; do
-        name=${src##*/}
+resolve_bin() {
+    local name=$1
+    local path
 
-        # Per-user state: never link these from /root.
-        case "$name" in
-            .cursor|.cursor-server|.local|.cache|.config)
-                continue
-                ;;
-        esac
+    path=$(command -v "$name" || true)
+    if [[ -n "$path" && -x "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
 
-        # Never expose another generated IDE home through this HOME.
-        case "$name" in
-            *_ide)
-                continue
-                ;;
-        esac
-
-        [[ "$src" == "$IDE_HOME" ]] && continue
-
-        dst="$IDE_HOME/$name"
-
-        [[ -e "$dst" || -L "$dst" ]] ||
-            ln -s "$src" "$dst"
+    for path in "/usr/bin/$name" "/bin/$name"; do
+        if [[ -x "$path" ]]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
     done
 
-    export HOME="$IDE_HOME"
-    cd "$HOME"
+    return 1
+}
+
+require_user() {
+    [[ "${ROOT_IDE_USER:-}" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        die "ROOT_IDE_USER is missing or invalid"
+}
+
+bind_private() {
+    local name=$1
+    local backing="$DATA_ROOT/$name"
+    local target="/root/$name"
+
+    case "$name" in
+        .[A-Za-z0-9_-]*)
+            ;;
+        *)
+            die "invalid private directory: $name"
+            ;;
+    esac
+
+    case "$name" in
+        *[!A-Za-z0-9._-]*)
+            die "invalid private directory: $name"
+            ;;
+    esac
+
+    if [[ -L "$backing" ]]; then
+        die "refusing to use symlink: $backing"
+    fi
+
+    if [[ -e "$backing" && ! -d "$backing" ]]; then
+        die "backing path is not a directory: $backing"
+    fi
+
+    mkdir -p -m 0700 -- "$backing"
+    chmod 0700 -- "$backing"
+
+    if [[ -L "$target" ]]; then
+        die "refusing to mount over symlink: $target"
+    fi
+
+    if [[ -e "$target" && ! -d "$target" ]]; then
+        die "mountpoint is not a directory: $target"
+    fi
+
+    if [[ ! -d "$target" ]]; then
+        mkdir -p -m 0700 -- "$target"
+    fi
+
+    "$MOUNT_BIN" --bind "$backing" "$target"
+}
+
+enter_namespace() {
+    local wrapper=$0
+    local dir unshare_bin parent_mnt
+
+    [[ $# -eq 0 ]] || die "unexpected arguments"
+    require_user
+
+    unshare_bin=$(resolve_bin unshare) ||
+        die "unshare not found; util-linux is required"
+    resolve_bin mount >/dev/null ||
+        die "mount not found"
+
+    if [[ "$wrapper" != /* ]]; then
+        dir=$(CDPATH= cd -- "$(dirname -- "$wrapper")" && pwd -P) ||
+            die "cannot resolve wrapper path"
+        wrapper=$dir/$(basename -- "$wrapper")
+    fi
+
+    parent_mnt=$(readlink -- /proc/self/ns/mnt) ||
+        die "cannot read the current mount namespace"
+    export ROOT_IDE_PARENT_MNT=$parent_mnt
+
+    # Mount namespace only. Do not unshare pid, net, user, or uts.
+    exec "$unshare_bin" --mount -- "$wrapper" "$INSIDE_FLAG" ||
+        die "failed to enter a mount namespace"
+}
+
+inside_namespace() {
+    local self_mnt host_mnt name
+
+    [[ $# -eq 1 ]] || die "unexpected arguments"
+    require_user
+
+    # mount --make-rprivate / on the host namespace would stop mount
+    # propagation for the whole machine. Mount only after unshare has
+    # actually moved this process off both its parent and pid 1.
+    self_mnt=$(readlink -- /proc/self/ns/mnt) ||
+        die "cannot read the current mount namespace"
+    host_mnt=$(readlink -- /proc/1/ns/mnt) ||
+        die "cannot read the init mount namespace"
+
+    [[ -n "${ROOT_IDE_PARENT_MNT:-}" ]] ||
+        die "refusing to mount without a namespace token"
+    [[ "$self_mnt" != "$ROOT_IDE_PARENT_MNT" ]] ||
+        die "refusing to mount outside a new mount namespace"
+    [[ "$self_mnt" != "$host_mnt" ]] ||
+        die "refusing to mount the host mount namespace"
+
+    unset ROOT_IDE_PARENT_MNT
+
+    MOUNT_BIN=$(resolve_bin mount) ||
+        die "mount not found"
+
+    "$MOUNT_BIN" --make-rprivate /
+
+    DATA_ROOT="$DATA_BASE/$ROOT_IDE_USER"
+
+    if [[ -L "$DATA_BASE" || -L "$DATA_ROOT" ]]; then
+        die "refusing to use a symlink data directory"
+    fi
+
+    if [[ -e "$DATA_BASE" && ! -d "$DATA_BASE" ]]; then
+        die "data root is not a directory: $DATA_BASE"
+    fi
+
+    if [[ -e "$DATA_ROOT" && ! -d "$DATA_ROOT" ]]; then
+        die "data path is not a directory: $DATA_ROOT"
+    fi
+
+    mkdir -p -m 0700 -- "$DATA_BASE" "$DATA_ROOT"
+    chmod 0700 -- "$DATA_BASE" "$DATA_ROOT"
+
+    for name in "${PRIVATE_DIRS[@]}"; do
+        bind_private "$name"
+    done
+
+    [[ -x /bin/bash ]] || die "/bin/bash is not executable"
+
+    export HOME=/root
+
+    if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+        exec /bin/bash -c "$SSH_ORIGINAL_COMMAND"
+    fi
+
+    exec /bin/bash -l
+}
+
+if [[ "${1:-}" != "$INSIDE_FLAG" ]]; then
+    enter_namespace "$@"
 fi
 
-SHELL_BIN="${SHELL:-/bin/bash}"
-
-[[ -x "$SHELL_BIN" ]] || SHELL_BIN=/bin/bash
-[[ -x "$SHELL_BIN" ]] || SHELL_BIN=/bin/sh
-
-if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
-    exec "$SHELL_BIN" -c "$SSH_ORIGINAL_COMMAND"
-else
-    exec "$SHELL_BIN" -l
-fi
+inside_namespace "$@"

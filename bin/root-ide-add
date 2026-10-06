@@ -3,88 +3,185 @@ set -euo pipefail
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys
 WRAPPER=/usr/local/libexec/root-ide-ssh
+DATA_BASE=/var/lib/root-ide
+TMP_FILES=()
 
 die() {
     echo "root-ide-add: $*" >&2
     exit 1
 }
 
+track_tmp() {
+    TMP_FILES+=("$1")
+}
+
+cleanup_tmp() {
+    if [[ ${#TMP_FILES[@]} -gt 0 ]]; then
+        rm -f -- "${TMP_FILES[@]}"
+    fi
+}
+
 usage() {
-    echo "Usage:"
-    echo "  root-ide-add <name> < public_key.pub"
-    echo "  root-ide-add <name> 'ssh-ed25519 AAAA... comment'"
-    exit 2
+    cat <<'EOF'
+Usage:
+  root-ide-add <name> < public_key.pub
+  root-ide-add <name> 'ssh-ed25519 AAAA... comment'
+EOF
 }
 
-[[ $EUID -eq 0 ]] || die "run as root"
-[[ $# -ge 1 && $# -le 2 ]] || usage
-[[ -x "$WRAPPER" ]] || die "root-ide-ssh is not installed"
+is_managed_line() {
+    [[ "$1" == 'environment="ROOT_IDE_USER='*'",command="/usr/local/libexec/root-ide-ssh" '* ]]
+}
 
-NAME=$1
+is_plain_key() {
+    case "$1" in
+        ssh-*|ecdsa-*|sk-*)
+            return 0
+            ;;
+    esac
 
-[[ "$NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
-    die "name may contain only letters, numbers, _ and -"
+    return 1
+}
 
-if [[ $# -eq 2 ]]; then
-    PUBKEY=$2
-else
-    IFS= read -r PUBKEY || true
+managed_user() {
+    local rest=${1#environment=\"ROOT_IDE_USER=}
+    printf '%s\n' "${rest%%\"*}"
+}
+
+key_data_of() {
+    local rest=$1
+    local type
+
+    if ! is_plain_key "$rest"; then
+        rest=${rest#* }
+    fi
+
+    type=${rest%%[[:space:]]*}
+    rest=${rest#"$type"}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    printf '%s\n' "${rest%%[[:space:]]*}"
+}
+
+format_managed_line() {
+    printf '%s\n' \
+        "environment=\"ROOT_IDE_USER=${1}\",command=\"${WRAPPER}\" ${2} ${3} ${4}"
+}
+
+filter_authorized_lines() {
+    local name=$1
+    local key_data=$2
+    local line
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if is_managed_line "$line" && [[ "$(managed_user "$line")" == "$name" ]]; then
+            continue
+        fi
+
+        if { is_plain_key "$line" || is_managed_line "$line"; } &&
+            [[ "$(key_data_of "$line")" == "$key_data" ]]
+        then
+            continue
+        fi
+
+        printf '%s\n' "$line"
+    done
+}
+
+main() {
+    local name pubkey key_type key_data key_comment rest comment data_root
+    local tmp_key tmp_ak
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
+    [[ $EUID -eq 0 ]] || die "run as root"
+    [[ $# -ge 1 && $# -le 2 ]] || {
+        usage >&2
+        exit 2
+    }
+    [[ -x "$WRAPPER" ]] || die "root-ide-ssh is not installed"
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen not found"
+
+    name=$1
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        die "name may contain only letters, numbers, _ and -"
+
+    if [[ $# -eq 2 ]]; then
+        pubkey=$2
+    else
+        IFS= read -r pubkey || true
+    fi
+
+    pubkey=${pubkey%$'\r'}
+    [[ -n "${pubkey:-}" ]] || die "public key is empty"
+    [[ "$pubkey" != *$'\n'* && "$pubkey" != *$'\r'* ]] ||
+        die "public key must be a single line"
+
+    key_type=${pubkey%%[[:space:]]*}
+    rest=${pubkey#"$key_type"}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    [[ -n "$rest" ]] || die "invalid public key"
+
+    key_data=${rest%%[[:space:]]*}
+    key_comment=${rest#"$key_data"}
+    key_comment=${key_comment#"${key_comment%%[![:space:]]*}"}
+    [[ -n "$key_data" ]] || die "invalid public key"
+
+    case "$key_type" in
+        ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*)
+            ;;
+        *)
+            die "unsupported or invalid public key type: $key_type"
+            ;;
+    esac
+
+    trap cleanup_tmp EXIT
+
+    tmp_key=$(mktemp) ||
+        die "cannot create a temporary key file"
+    track_tmp "$tmp_key"
+
+    printf '%s %s\n' "$key_type" "$key_data" > "$tmp_key"
+    ssh-keygen -l -f "$tmp_key" >/dev/null ||
+        die "invalid SSH public key"
+
+    comment=${key_comment:-$name}
+    data_root="$DATA_BASE/$name"
+
+    mkdir -p -m 0700 -- "$DATA_BASE" "$data_root"
+    chmod 0700 -- "$DATA_BASE" "$data_root"
+
+    install -d -m 0700 /root/.ssh
+
+    if [[ -L "$AUTHORIZED_KEYS" ]]; then
+        die "refusing to edit symlink: $AUTHORIZED_KEYS"
+    fi
+
+    if [[ -e "$AUTHORIZED_KEYS" && ! -f "$AUTHORIZED_KEYS" ]]; then
+        die "refusing to edit non-file: $AUTHORIZED_KEYS"
+    fi
+
+    [[ -e "$AUTHORIZED_KEYS" ]] || touch -- "$AUTHORIZED_KEYS"
+    chmod 0600 -- "$AUTHORIZED_KEYS"
+
+    tmp_ak=$(mktemp "$(dirname -- "$AUTHORIZED_KEYS")/.authorized_keys.XXXXXX") ||
+        die "cannot create a temporary authorized_keys file"
+    track_tmp "$tmp_ak"
+
+    filter_authorized_lines "$name" "$key_data" \
+        < "$AUTHORIZED_KEYS" > "$tmp_ak"
+
+    format_managed_line "$name" "$key_type" "$key_data" "$comment" \
+        >> "$tmp_ak"
+
+    chmod 0600 -- "$tmp_ak"
+    mv -f -- "$tmp_ak" "$AUTHORIZED_KEYS"
+
+    echo "$name -> $data_root"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-[[ -n "${PUBKEY:-}" ]] || die "public key is empty"
-
-read -r KEY_TYPE KEY_DATA KEY_COMMENT <<< "$PUBKEY"
-
-case "$KEY_TYPE" in
-    ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*)
-        ;;
-    *)
-        die "unsupported or invalid public key type: $KEY_TYPE"
-        ;;
-esac
-
-[[ -n "${KEY_DATA:-}" ]] || die "invalid public key"
-
-# Validate actual key data.
-tmp_key="$(mktemp)"
-tmp_ak="$(mktemp)"
-trap 'rm -f "$tmp_key" "$tmp_ak"' EXIT
-
-printf '%s %s\n' "$KEY_TYPE" "$KEY_DATA" > "$tmp_key"
-ssh-keygen -l -f "$tmp_key" >/dev/null 2>&1 ||
-    die "invalid SSH public key"
-
-IDE_HOME="/root/${NAME}_ide"
-
-install -d -m 0700 "$IDE_HOME"
-install -d -m 0700 /root/.ssh
-touch "$AUTHORIZED_KEYS"
-chmod 0600 "$AUTHORIZED_KEYS"
-
-# Remove:
-#   - previous entry for this IDE_HOME
-#   - previous managed entry using the same key
-awk \
-    -v home="$IDE_HOME" \
-    -v key="$KEY_DATA" '
-{
-    managed = index($0, "command=\"/usr/local/libexec/root-ide-ssh\"") > 0
-    same_home = index($0, "environment=\"IDE_HOME=" home "\"") > 0
-    same_key = managed && index($0, key) > 0
-
-    if (!same_home && !same_key)
-        print
-}
-' "$AUTHORIZED_KEYS" > "$tmp_ak"
-
-cat "$tmp_ak" > "$AUTHORIZED_KEYS"
-
-COMMENT="${KEY_COMMENT:-$NAME}"
-
-printf '%s\n' \
-    "environment=\"IDE_HOME=$IDE_HOME\",command=\"$WRAPPER\" $KEY_TYPE $KEY_DATA $COMMENT" \
-    >> "$AUTHORIZED_KEYS"
-
-chmod 0600 "$AUTHORIZED_KEYS"
-
-echo "$NAME -> $IDE_HOME"
